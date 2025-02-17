@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http.Headers;
@@ -73,7 +73,7 @@ namespace GitHub.Runner.Sdk
         {
             var headerValues = new List<ProductInfoHeaderValue>();
             headerValues.Add(new ProductInfoHeaderValue($"GitHubActionsRunner-Plugin", BuildConstants.RunnerPackage.Version));
-            headerValues.Add(new ProductInfoHeaderValue($"({RuntimeInformation.OSDescription.Trim()})"));
+            headerValues.Add(new ProductInfoHeaderValue($"({StringUtil.SanitizeUserAgentHeader(RuntimeInformation.OSDescription)})"));
 
             if (VssClientHttpRequestSettings.Default.UserAgent != null && VssClientHttpRequestSettings.Default.UserAgent.Count > 0)
             {
@@ -220,20 +220,12 @@ namespace GitHub.Runner.Sdk
             return input;
         }
 
-        private Dictionary<string, string> _commandEscapeMappings = new(StringComparer.OrdinalIgnoreCase)
+        private Dictionary<string, string> _commandEscapeMappings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
-            {
-                ";", "%3B"
-            },
-            {
-                "\r", "%0D"
-            },
-            {
-                "\n", "%0A"
-            },
-            {
-                "]", "%5D"
-            },
+            { ";", "%3B" },
+            { "\r", "%0D" },
+            { "\n", "%0A" },
+            { "]", "%5D" },
         };
     }
 }

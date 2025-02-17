@@ -18,6 +18,20 @@ while [ -h "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symli
 done
 DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 
+# Wait for docker to start
+if [ ! -z "$RUNNER_WAIT_FOR_DOCKER_IN_SECONDS" ]; then
+    if [ "$RUNNER_WAIT_FOR_DOCKER_IN_SECONDS" -gt 0 ]; then
+        echo "Waiting for docker to be ready."
+        for i in $(seq "$RUNNER_WAIT_FOR_DOCKER_IN_SECONDS"); do
+            if docker ps > /dev/null 2>&1; then
+                echo "Docker is ready."
+                break
+            fi
+            "$DIR"/safe_sleep.sh 1
+        done
+    fi
+fi
+
 updateFile="update.finished"
 "$DIR"/bin/Runner.Listener run $*
 
@@ -56,6 +70,9 @@ elif [[ $returnCode == 4 ]]; then
         "$DIR"/safe_sleep.sh 1
     done
     exit 2
+elif [[ $returnCode == 5 ]]; then
+    echo "Runner listener exit with Session Conflict error, stop the service, no retry needed."
+    exit 0
 else
     echo "Exiting with unknown error code: ${returnCode}"
     exit 0

@@ -3,10 +3,15 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using GitHub.DistributedTask.ObjectTemplating.Tokens;
+using GitHub.DistributedTask.Pipelines;
+using GitHub.DistributedTask.Pipelines.ContextData;
 using GitHub.DistributedTask.WebApi;
 using GitHub.Runner.Listener;
+using GitHub.Runner.Listener.Configuration;
 using GitHub.Services.WebApi;
 using Moq;
+using Sdk.RSWebApi.Contracts;
 using Xunit;
 
 using Pipelines = GitHub.DistributedTask.Pipelines;
@@ -18,6 +23,8 @@ namespace GitHub.Runner.Common.Tests.Listener
         private Mock<IProcessChannel> _processChannel;
         private Mock<IProcessInvoker> _processInvoker;
         private Mock<IRunnerServer> _runnerServer;
+
+        private Mock<IRunServer> _runServer;
         private Mock<IConfigurationStore> _configurationStore;
 
         public JobDispatcherL0()
@@ -25,23 +32,27 @@ namespace GitHub.Runner.Common.Tests.Listener
             _processChannel = new Mock<IProcessChannel>();
             _processInvoker = new Mock<IProcessInvoker>();
             _runnerServer = new Mock<IRunnerServer>();
+            _runServer = new Mock<IRunServer>();
             _configurationStore = new Mock<IConfigurationStore>();
         }
 
-        private Pipelines.AgentJobRequestMessage CreateJobRequestMessage()
+        private Pipelines.AgentJobRequestMessage CreateJobRequestMessage(string billingOwnerId = null)
         {
             TaskOrchestrationPlanReference plan = new();
             TimelineReference timeline = null;
             Guid jobId = Guid.NewGuid();
-            var result = new Pipelines.AgentJobRequestMessage(plan, timeline, jobId, "someJob", "someJob", null, null, null, new Dictionary<string, VariableValue>(), new List<MaskHint>(), new Pipelines.JobResources(), new Pipelines.ContextData.DictionaryContextData(), new Pipelines.WorkspaceOptions(), new List<Pipelines.ActionStep>(), null, null, null, null);
+            var result = new Pipelines.AgentJobRequestMessage(plan, timeline, jobId, "someJob", "someJob", null, null, null, new Dictionary<string, VariableValue>(), new List<MaskHint>(), new Pipelines.JobResources(), new Pipelines.ContextData.DictionaryContextData(), new Pipelines.WorkspaceOptions(), new List<Pipelines.ActionStep>(), null, null, null, null, null);
             result.ContextData["github"] = new Pipelines.ContextData.DictionaryContextData();
+            result.BillingOwnerId = billingOwnerId;
             return result;
         }
 
-        [Fact]
+        [Theory]
         [Trait("Level", "L0")]
         [Trait("Category", "Runner")]
-        public async void DispatchesJobRequest()
+        [InlineData(null)]
+        [InlineData("billingOwnerId")]
+        public async void DispatchesJobRequest(string billingOwnerId)
         {
             //Arrange
             using (var hc = new TestHostContext(this))
@@ -57,7 +68,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                 jobDispatcher.Initialize(hc);
 
                 var ts = new CancellationTokenSource();
-                Pipelines.AgentJobRequestMessage message = CreateJobRequestMessage();
+                Pipelines.AgentJobRequestMessage message = CreateJobRequestMessage(billingOwnerId);
                 string strMessage = JsonUtility.ToString(message);
 
                 _processInvoker.Setup(x => x.ExecuteAsync(It.IsAny<String>(), It.IsAny<String>(), "spawnclient 1 2", null, It.IsAny<CancellationToken>()))
@@ -139,7 +150,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                 var jobDispatcher = new JobDispatcher();
                 jobDispatcher.Initialize(hc);
 
-                await jobDispatcher.RenewJobRequestAsync(poolId, requestId, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
+                await jobDispatcher.RenewJobRequestAsync(It.IsAny<AgentJobRequestMessage>(), It.IsAny<ServiceEndpoint>(), poolId, requestId, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
 
                 Assert.True(firstJobRequestRenewed.Task.IsCompletedSuccessfully);
                 _runnerServer.Verify(x => x.RenewAgentRequestAsync(It.IsAny<int>(), It.IsAny<long>(), It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Exactly(5));
@@ -197,11 +208,80 @@ namespace GitHub.Runner.Common.Tests.Listener
                 var jobDispatcher = new JobDispatcher();
                 jobDispatcher.Initialize(hc);
 
-                await jobDispatcher.RenewJobRequestAsync(poolId, requestId, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
+                await jobDispatcher.RenewJobRequestAsync(It.IsAny<AgentJobRequestMessage>(), It.IsAny<ServiceEndpoint>(), poolId, requestId, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
 
                 Assert.True(firstJobRequestRenewed.Task.IsCompletedSuccessfully, "First renew should succeed.");
                 Assert.False(cancellationTokenSource.IsCancellationRequested);
                 _runnerServer.Verify(x => x.RenewAgentRequestAsync(It.IsAny<int>(), It.IsAny<long>(), It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Exactly(5));
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Runner")]
+        public async void DispatcherRenewJobOnRunServiceStopOnJobNotFoundExceptions()
+        {
+            //Arrange
+            using (var hc = new TestHostContext(this))
+            {
+                int poolId = 1;
+                Int64 requestId = 1000;
+                int count = 0;
+
+                var trace = hc.GetTrace(nameof(DispatcherRenewJobOnRunServiceStopOnJobNotFoundExceptions));
+                TaskCompletionSource<int> firstJobRequestRenewed = new();
+                CancellationTokenSource cancellationTokenSource = new();
+
+                TaskAgentJobRequest request = new();
+                PropertyInfo lockUntilProperty = request.GetType().GetProperty("LockedUntil", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                Assert.NotNull(lockUntilProperty);
+                lockUntilProperty.SetValue(request, DateTime.UtcNow.AddMinutes(5));
+
+                hc.SetSingleton<IRunServer>(_runServer.Object);
+                hc.SetSingleton<IConfigurationStore>(_configurationStore.Object);
+                _configurationStore.Setup(x => x.GetSettings()).Returns(new RunnerSettings() { PoolId = 1 });
+                _ = _runServer.Setup(x => x.RenewJobAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+                            .Returns(() =>
+                            {
+                                count++;
+                                if (!firstJobRequestRenewed.Task.IsCompletedSuccessfully)
+                                {
+                                    trace.Info("First renew happens.");
+                                }
+
+                                if (count < 5)
+                                {
+                                    var response = new RenewJobResponse()
+                                    {
+                                        LockedUntil = request.LockedUntil.Value
+                                    };
+                                    return Task.FromResult<RenewJobResponse>(response);
+                                }
+                                else if (count == 5)
+                                {
+                                    cancellationTokenSource.CancelAfter(10000);
+                                    throw new TaskOrchestrationJobNotFoundException("");
+                                }
+                                else
+                                {
+                                    throw new InvalidOperationException("Should not reach here.");
+                                }
+                            });
+
+
+                var jobDispatcher = new JobDispatcher();
+                jobDispatcher.Initialize(hc);
+                EnableRunServiceJobForJobDispatcher(jobDispatcher);
+
+                // Set the value of the _isRunServiceJob field to true
+                var isRunServiceJobField = typeof(JobDispatcher).GetField("_isRunServiceJob", BindingFlags.NonPublic | BindingFlags.Instance);
+                isRunServiceJobField.SetValue(jobDispatcher, true);
+
+                await jobDispatcher.RenewJobRequestAsync(GetAgentJobRequestMessage(), GetServiceEndpoint(), poolId, requestId, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
+
+                Assert.True(firstJobRequestRenewed.Task.IsCompletedSuccessfully, "First renew should succeed.");
+                Assert.False(cancellationTokenSource.IsCancellationRequested);
+                _runServer.Verify(x => x.RenewJobAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Exactly(5));
             }
         }
 
@@ -256,7 +336,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                 var jobDispatcher = new JobDispatcher();
                 jobDispatcher.Initialize(hc);
 
-                await jobDispatcher.RenewJobRequestAsync(poolId, requestId, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
+                await jobDispatcher.RenewJobRequestAsync(It.IsAny<AgentJobRequestMessage>(), It.IsAny<ServiceEndpoint>(), poolId, requestId, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
 
                 Assert.True(firstJobRequestRenewed.Task.IsCompletedSuccessfully, "First renew should succeed.");
                 Assert.False(cancellationTokenSource.IsCancellationRequested);
@@ -312,8 +392,9 @@ namespace GitHub.Runner.Common.Tests.Listener
                 var jobDispatcher = new JobDispatcher();
                 jobDispatcher.Initialize(hc);
 
+
                 // Act
-                await jobDispatcher.RenewJobRequestAsync(0, 0, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
+                await jobDispatcher.RenewJobRequestAsync(It.IsAny<AgentJobRequestMessage>(), It.IsAny<ServiceEndpoint>(), 0, 0, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
 
                 // Assert
                 _configurationStore.Verify(x => x.SaveSettings(It.Is<RunnerSettings>(settings => settings.AgentName == newName)), Times.Once);
@@ -368,7 +449,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                 jobDispatcher.Initialize(hc);
 
                 // Act
-                await jobDispatcher.RenewJobRequestAsync(0, 0, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
+                await jobDispatcher.RenewJobRequestAsync(It.IsAny<AgentJobRequestMessage>(), It.IsAny<ServiceEndpoint>(), 0, 0, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
 
                 // Assert
                 _configurationStore.Verify(x => x.SaveSettings(It.IsAny<RunnerSettings>()), Times.Never);
@@ -421,7 +502,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                 jobDispatcher.Initialize(hc);
 
                 // Act
-                await jobDispatcher.RenewJobRequestAsync(0, 0, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
+                await jobDispatcher.RenewJobRequestAsync(It.IsAny<AgentJobRequestMessage>(), It.IsAny<ServiceEndpoint>(), 0, 0, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
 
                 // Assert
                 _configurationStore.Verify(x => x.SaveSettings(It.IsAny<RunnerSettings>()), Times.Never);
@@ -479,7 +560,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                 var jobDispatcher = new JobDispatcher();
                 jobDispatcher.Initialize(hc);
 
-                await jobDispatcher.RenewJobRequestAsync(poolId, requestId, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
+                await jobDispatcher.RenewJobRequestAsync(It.IsAny<AgentJobRequestMessage>(), It.IsAny<ServiceEndpoint>(), poolId, requestId, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
 
                 Assert.True(firstJobRequestRenewed.Task.IsCompletedSuccessfully, "First renew should succeed.");
                 Assert.True(cancellationTokenSource.IsCancellationRequested);
@@ -536,7 +617,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                 var jobDispatcher = new JobDispatcher();
                 jobDispatcher.Initialize(hc);
 
-                await jobDispatcher.RenewJobRequestAsync(poolId, requestId, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
+                await jobDispatcher.RenewJobRequestAsync(It.IsAny<AgentJobRequestMessage>(), It.IsAny<ServiceEndpoint>(), poolId, requestId, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
 
                 Assert.False(firstJobRequestRenewed.Task.IsCompletedSuccessfully, "First renew should failed.");
                 Assert.False(cancellationTokenSource.IsCancellationRequested);
@@ -600,7 +681,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                 var jobDispatcher = new JobDispatcher();
                 jobDispatcher.Initialize(hc);
 
-                await jobDispatcher.RenewJobRequestAsync(poolId, requestId, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
+                await jobDispatcher.RenewJobRequestAsync(It.IsAny<AgentJobRequestMessage>(), It.IsAny<ServiceEndpoint>(), poolId, requestId, Guid.Empty, Guid.NewGuid().ToString(), firstJobRequestRenewed, cancellationTokenSource.Token);
 
                 Assert.True(firstJobRequestRenewed.Task.IsCompletedSuccessfully, "First renew should succeed.");
                 Assert.False(cancellationTokenSource.IsCancellationRequested);
@@ -656,8 +737,85 @@ namespace GitHub.Runner.Common.Tests.Listener
                 await jobDispatcher.WaitAsync(CancellationToken.None);
 
                 Assert.True(jobDispatcher.RunOnceJobCompleted.Task.IsCompleted, "JobDispatcher should set task complete token for one time agent.");
-                Assert.True(jobDispatcher.RunOnceJobCompleted.Task.Result, "JobDispatcher should set task complete token to 'TRUE' for one time agent.");
+                if (jobDispatcher.RunOnceJobCompleted.Task.IsCompleted)
+                {
+                    Assert.True(await jobDispatcher.RunOnceJobCompleted.Task, "JobDispatcher should set task complete token to 'TRUE' for one time agent.");
+                }
             }
+        }
+
+        private static void EnableRunServiceJobForJobDispatcher(JobDispatcher jobDispatcher)
+        {
+            // Set the value of the _isRunServiceJob field to true
+            var isRunServiceJobField = typeof(JobDispatcher).GetField("_isRunServiceJob", BindingFlags.NonPublic | BindingFlags.Instance);
+            isRunServiceJobField.SetValue(jobDispatcher, true);
+        }
+
+        private static ServiceEndpoint GetServiceEndpoint()
+        {
+            var serviceEndpoint = new ServiceEndpoint
+            {
+                Authorization = new EndpointAuthorization
+                {
+                    Scheme = EndpointAuthorizationSchemes.OAuth
+                }
+            };
+            serviceEndpoint.Authorization.Parameters.Add("AccessToken", "token");
+            return serviceEndpoint;
+        }
+
+        private static AgentJobRequestMessage GetAgentJobRequestMessage()
+        {
+            var message = new AgentJobRequestMessage(
+                new TaskOrchestrationPlanReference()
+                {
+                    PlanType = "Build",
+                    PlanId = Guid.NewGuid(),
+                    Version = 1
+                },
+                new TimelineReference()
+                {
+                    Id = Guid.NewGuid()
+                },
+                Guid.NewGuid(),
+                "jobDisplayName",
+                "jobName",
+                null,
+                null,
+                new List<TemplateToken>(),
+                new Dictionary<string, VariableValue>()
+                {
+                    {
+                        "variables",
+                        new VariableValue()
+                        {
+                            IsSecret = false,
+                            Value = "variables"
+                        }
+                    }
+                },
+                new List<MaskHint>()
+                {
+                    new MaskHint()
+                    {
+                        Type = MaskType.Variable,
+                        Value = "maskHints"
+                    }
+                },
+                new JobResources(),
+                new DictionaryContextData(),
+                new WorkspaceOptions(),
+                new List<JobStep>(),
+                new List<string>()
+                {
+                    "fileTable"
+                },
+                null,
+                new List<TemplateToken>(),
+                new ActionsEnvironmentReference("env"),
+                null
+            );
+            return message;
         }
     }
 }

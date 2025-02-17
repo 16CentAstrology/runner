@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Net;
 using System.Net.Http;
 using System.Threading;
@@ -9,23 +9,23 @@ using GitHub.Services.OAuth;
 
 namespace GitHub.Services.Common
 {
-    public class RawHttpMessageHandler: HttpMessageHandler
+    public class RawHttpMessageHandler : HttpMessageHandler
     {
         public RawHttpMessageHandler(
-            VssOAuthCredential credentials)
+            FederatedCredential credentials)
             : this(credentials, new RawClientHttpRequestSettings())
         {
         }
 
         public RawHttpMessageHandler(
-            VssOAuthCredential credentials,
+            FederatedCredential credentials,
             RawClientHttpRequestSettings settings)
             : this(credentials, settings, new HttpClientHandler())
         {
         }
 
         public RawHttpMessageHandler(
-            VssOAuthCredential credentials,
+            FederatedCredential credentials,
             RawClientHttpRequestSettings settings,
             HttpMessageHandler innerHandler)
         {
@@ -56,7 +56,7 @@ namespace GitHub.Services.Common
         /// <summary>
         /// Gets the credentials associated with this handler.
         /// </summary>
-        public VssOAuthCredential Credentials
+        public FederatedCredential Credentials
         {
             get;
             private set;
@@ -109,9 +109,9 @@ namespace GitHub.Services.Common
             lock (m_thisLock)
             {
                 // Ensure that we attempt to use the most appropriate authentication mechanism by default.
-                if (m_tokenProvider == null)
+                if (m_tokenProvider == null && !(this.Credentials is NoOpCredentials))
                 {
-                    m_tokenProvider = this.Credentials.GetTokenProvider(request.RequestUri);
+                    m_tokenProvider = this.Credentials.CreateTokenProvider(request.RequestUri, null, null);
                 }
             }
 
@@ -120,7 +120,9 @@ namespace GitHub.Services.Common
             Boolean succeeded = false;
             HttpResponseMessageWrapper responseWrapper;
 
-            Int32 retries = m_maxAuthRetries;
+            Boolean lastResponseDemandedProxyAuth = false;
+            // do not retry if we cannot recreate tokens
+            Int32 retries = this.Credentials is NoOpCredentials ? 0 : m_maxAuthRetries;
             try
             {
                 tokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -136,9 +138,21 @@ namespace GitHub.Services.Common
                         response.Dispose();
                     }
 
+                    this.Settings.ApplyTo(request);
+
                     // Let's start with sending a token
-                    IssuedToken token = await m_tokenProvider.GetTokenAsync(null, tokenSource.Token).ConfigureAwait(false);
-                    ApplyToken(request, token);
+                    IssuedToken token = null;
+                    if (m_tokenProvider != null)
+                    {
+                        token = await m_tokenProvider.GetTokenAsync(null, tokenSource.Token).ConfigureAwait(false);
+                        ApplyToken(request, token, applyICredentialsToWebProxy: lastResponseDemandedProxyAuth);
+                    }
+
+                    // The WinHttpHandler will chunk any content that does not have a computed length which is
+                    // not what we want. By loading into a buffer up-front we bypass this behavior and there is
+                    // no difference in the normal HttpClientHandler behavior here since this is what they were
+                    // already doing.
+                    await BufferRequestContentAsync(request, tokenSource.Token).ConfigureAwait(false);
 
                     // ConfigureAwait(false) enables the continuation to be run outside any captured
                     // SyncronizationContext (such as ASP.NET's) which keeps things from deadlocking...
@@ -147,7 +161,8 @@ namespace GitHub.Services.Common
                     responseWrapper = new HttpResponseMessageWrapper(response);
 
                     var isUnAuthorized = responseWrapper.StatusCode == HttpStatusCode.Unauthorized;
-                    if (!isUnAuthorized)
+                    lastResponseDemandedProxyAuth = responseWrapper.StatusCode == HttpStatusCode.ProxyAuthenticationRequired;
+                    if (!isUnAuthorized && !lastResponseDemandedProxyAuth)
                     {
                         // Validate the token after it has been successfully authenticated with the server.
                         m_tokenProvider?.ValidateToken(token, responseWrapper);
@@ -211,15 +226,42 @@ namespace GitHub.Services.Common
             }
         }
 
+        private static async Task BufferRequestContentAsync(
+             HttpRequestMessage request,
+             CancellationToken cancellationToken)
+        {
+            if (request.Content != null &&
+                request.Headers.TransferEncodingChunked != true)
+            {
+                Int64? contentLength = request.Content.Headers.ContentLength;
+                if (contentLength == null)
+                {
+                    await request.Content.LoadIntoBufferAsync().EnforceCancellation(cancellationToken).ConfigureAwait(false);
+                }
+
+                // Explicitly turn off chunked encoding since we have computed the request content size
+                request.Headers.TransferEncodingChunked = false;
+            }
+        }
+
         private void ApplyToken(
             HttpRequestMessage request,
-            IssuedToken token)
+            IssuedToken token,
+            bool applyICredentialsToWebProxy = false)
         {
             switch (token)
             {
                 case null:
                     return;
                 case ICredentials credentialsToken:
+                    if (applyICredentialsToWebProxy)
+                    {
+                        HttpClientHandler httpClientHandler = m_transportHandler as HttpClientHandler;
+                        if (httpClientHandler != null && httpClientHandler.Proxy != null)
+                        {
+                            httpClientHandler.Proxy.Credentials = credentialsToken;
+                        }
+                    }
                     m_credentialWrapper.InnerCredentials = credentialsToken;
                     break;
                 default:
@@ -254,7 +296,7 @@ namespace GitHub.Services.Common
         private CredentialWrapper m_credentialWrapper;
         private object m_thisLock;
         private const Int32 m_maxAuthRetries = 3;
-        private VssOAuthTokenProvider m_tokenProvider;
+        private IssuedTokenProvider m_tokenProvider;
 
         //.Net Core does not attempt NTLM schema on Linux, unless ICredentials is a CredentialCache instance
         //This workaround may not be needed after this corefx fix is consumed: https://github.com/dotnet/corefx/pull/7923
